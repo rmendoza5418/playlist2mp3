@@ -6,6 +6,7 @@ import argparse
 import os
 import re
 import sys
+import tempfile
 from pathlib import Path
 
 import requests
@@ -15,6 +16,7 @@ from dotenv import load_dotenv
 from spotdl.utils.ffmpeg import get_ffmpeg_path
 
 from . import __version__
+from .fallback import find_video, parse_failed_urls
 from .download import (
     UnavailablePlaylistError,
     build_spotdl_command,
@@ -24,7 +26,7 @@ from .download import (
     safe_folder_name,
     strip_control,
 )
-from .public import canonical_url, fetch_public_playlist, parse_playlist_id
+from .public import Track, canonical_url, fetch_public_playlist, parse_playlist_id
 from .spotify import ConfigError, Playlist
 
 FORMATS = ["mp3", "flac", "ogg", "opus", "m4a", "wav"]
@@ -96,6 +98,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cookie-file", metavar="PATH", type=existing_file)
     source.add_argument("--official", action="store_true",
                         help="force the official Spotify API (owned/collaborative only)")
+    p.add_argument("--no-fallback", action="store_true",
+                   help="do not search YouTube for tracks spotDL cannot match (--url only)")
     p.add_argument("--dry-run", action="store_true",
                    help="print the spotDL command without running it")
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -200,29 +204,102 @@ def _spotify_error(e: Exception) -> int:
     return 1
 
 
+def _read_failed(path: Path) -> set[str] | None:
+    """Return failed track URLs from a spotDL error file, or None if it is absent."""
+    if not path.exists():
+        return None
+    return parse_failed_urls(path.read_text(encoding="utf-8", errors="replace"))
+
+
+def _write_missing(folder: Path, missing: list[Track]) -> None:
+    path = folder / "missing.txt"
+    if not missing:
+        path.unlink(missing_ok=True)
+        return
+    lines = [
+        strip_control(f"{', '.join(t.artists)} - {t.name} | {t.url}") for t in missing
+    ]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def _run_public(url: str, args: argparse.Namespace) -> int:
+    """Download a public playlist, then try a YouTube fallback for unmatched tracks.
+
+    Pass 1 runs spotDL on the playlist. Pass 2 searches YouTube for each track
+    that pass 1 reported as failed and runs spotDL on "<youtube>|<spotify>" pairs.
+    Tracks still missing are listed in missing.txt. The exit code is 0 when
+    pass 1 or pass 2 ran, even with missing tracks. It is spotDL's own code only
+    when pass 1 returned non-zero and wrote no error file (a crash).
+    """
     playlist_id = parse_playlist_id(url)
     assert playlist_id is not None
     clean_url = canonical_url(playlist_id)
     try:
-        name, count = fetch_public_playlist(clean_url)
+        name, tracks = fetch_public_playlist(clean_url)
     except Exception as e:
         print(
             f"Error: could not read playlist. Is it public?\n{strip_control(str(e))}",
             file=sys.stderr,
         )
         return 1
-    print(f"Playlist: {strip_control(name)} ({count} tracks)")
+    print(f"Playlist: {strip_control(name)} ({len(tracks)} tracks)")
     folder = safe_folder_name(name, fallback=playlist_id)
-    cmd = build_spotdl_command(
-        clean_url, args.output, folder, args.format, args.bitrate,
-        args.threads, args.cookie_file,
-    )
+    target = Path(args.output) / folder
+
+    def command(queries: list[str], save_errors: Path | None = None) -> list[str]:
+        return build_spotdl_command(
+            queries, args.output, folder, args.format, args.bitrate,
+            args.threads, args.cookie_file, save_errors,
+        )
+
     if args.dry_run:
-        print(" ".join(cmd))
+        print(" ".join(command([clean_url])))
         return 0
-    print(f"Downloading (free mode) to {Path(args.output) / folder}")
-    return run_download(cmd, Path(args.output) / folder, None)
+    print(f"Downloading (free mode) to {target}")
+    with tempfile.TemporaryDirectory(prefix="playlist2mp3-") as tmp:
+        err1 = Path(tmp) / "errors1.txt"
+        rc = run_download(command([clean_url], err1), target, None)
+        failed = _read_failed(err1)
+        if failed is None:
+            if rc != 0:
+                return rc
+            failed = set()
+        by_url = {t.url: t for t in tracks}
+        unmatched = [by_url[u] for u in sorted(failed) if u in by_url]
+        by_spotdl = len(tracks) - len(unmatched)
+        by_youtube = 0
+        missing: list[Track] = []
+        if unmatched and not args.no_fallback:
+            print(
+                f"Searching YouTube for {len(unmatched)} tracks "
+                "spotDL could not match..."
+            )
+            pairs: list[str] = []
+            paired: list[Track] = []
+            for t in unmatched:
+                video = find_video(t)
+                if video:
+                    pairs.append(f"{video}|{t.url}")
+                    paired.append(t)
+                else:
+                    missing.append(t)
+            if pairs:
+                err2 = Path(tmp) / "errors2.txt"
+                rc2 = run_download(command(pairs, err2), target, None)
+                failed2 = _read_failed(err2)
+                if failed2 is None:
+                    failed2 = {t.url for t in paired} if rc2 != 0 else set()
+                still = [t for t in paired if t.url in failed2]
+                missing += still
+                by_youtube = len(paired) - len(still)
+        else:
+            missing = unmatched
+    _write_missing(target, missing)
+    print(
+        f"Done: {by_spotdl} downloaded by spotDL, {by_youtube} by YouTube "
+        f"fallback, {len(missing)} missing (see missing.txt)"
+    )
+    return 0
 
 
 def _run(argv: list[str] | None) -> int:
@@ -279,7 +356,7 @@ def _run(argv: list[str] | None) -> int:
     except SPOTIFY_ERRORS as e:
         return _spotify_error(e)
     cmd = build_spotdl_command(
-        playlist.url, args.output, folder, args.format, args.bitrate,
+        [playlist.url], args.output, folder, args.format, args.bitrate,
         args.threads, args.cookie_file,
     )
     if args.dry_run:

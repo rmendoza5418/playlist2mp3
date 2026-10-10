@@ -3,12 +3,23 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 
 _URL = re.compile(
     r"^https://open\.spotify\.com/(?:intl-[A-Za-z]{2,}(?:-[A-Za-z]+)?/)?"
     r"playlist/([A-Za-z0-9]{22})/?(?:[?#].*)?$"
 )
 _URI = re.compile(r"^spotify:playlist:([A-Za-z0-9]{22})$")
+
+
+@dataclass(frozen=True)
+class Track:
+    """One playlist track as read from Spotify."""
+
+    url: str
+    name: str
+    artists: list[str]
+    duration: int | None
 
 
 def parse_playlist_id(text: str) -> str | None:
@@ -23,8 +34,8 @@ def canonical_url(playlist_id: str) -> str:
     return f"https://open.spotify.com/playlist/{playlist_id}"
 
 
-def fetch_public_playlist(url: str) -> tuple[str, int]:
-    """Return (name, track count) of a public playlist. Needs no credentials."""
+def fetch_public_playlist(url: str) -> tuple[str, list[Track]]:
+    """Return (name, tracks) of a public playlist. Needs no credentials."""
     from spotdl.types.playlist import Playlist
     from spotdl.utils.spotify import SpotifyClient
 
@@ -34,4 +45,13 @@ def fetch_public_playlist(url: str) -> tuple[str, int]:
     except Exception:
         SpotifyClient.init(client_id="", client_secret="")
     meta, songs = Playlist.get_metadata(url)
-    return str(meta.get("name") or ""), len(songs)
+    tracks = [
+        Track(
+            url=str(song.url),
+            name=str(song.name),
+            artists=[str(a) for a in (song.artists or [])],
+            duration=int(song.duration) if song.duration else None,
+        )
+        for song in songs
+    ]
+    return str(meta.get("name") or ""), tracks

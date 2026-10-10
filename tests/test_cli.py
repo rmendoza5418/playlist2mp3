@@ -1,5 +1,7 @@
 import pytest
 
+from playlist2mp3.public import Track
+
 from playlist2mp3 import cli
 from playlist2mp3.spotify import Playlist, list_playlists, parse_playlist, track_total
 
@@ -267,7 +269,7 @@ def pub(monkeypatch):
 
     def fake_fetch(url):
         fetched.append(url)
-        return "trap soul & R&B\x1b", 100
+        return "trap soul & R&B\x1b", [Track(f"u{i}", "t", ["a"], 100) for i in range(100)]
 
     monkeypatch.setattr(cli, "fetch_public_playlist", fake_fetch)
     calls = []
@@ -372,3 +374,92 @@ def test_no_client_id_prompt_ctrl_c(pub, monkeypatch):
     with pytest.raises(SystemExit) as e:
         cli.main([])
     assert e.value.code == 130
+
+
+def sp_url(c):
+    return "https://open.spotify.com/track/" + c * 22
+
+
+T1 = Track(sp_url("a"), "Under Your Skin", ["drill clinton"], 120)
+T2 = Track(sp_url("b"), "lost lost", ["drill clinton"], 104)
+T3 = Track(sp_url("c"), "Want U", ["dark & sexy"], None)
+T4 = Track(sp_url("d"), "fine", ["x"], 100)
+YT2 = "https://www.youtube.com/watch?v=N8m17jVNaFQ"
+
+
+@pytest.fixture
+def fb(monkeypatch):
+    monkeypatch.delenv("SPOTIFY_CLIENT_ID", raising=False)
+    monkeypatch.setattr(cli, "load_dotenv", lambda: None)
+    monkeypatch.setattr(cli, "ffmpeg_missing", lambda: False)
+    monkeypatch.setattr(
+        cli, "fetch_public_playlist", lambda url: ("PL", [T1, T2, T3, T4])
+    )
+    monkeypatch.setattr(
+        cli, "find_video", lambda t: YT2 if t is T2 else None
+    )
+    state = {"calls": [], "pass2_fail": ""}
+
+    def fake_run(cmd, **kw):
+        state["calls"].append(cmd)
+        err = cmd[cmd.index("--save-errors") + 1]
+        n = len(state["calls"])
+        if n == 1:
+            text = "2024-01-01 00:00:00\n" + "".join(
+                f"{t.url} - LookupError: No results found for song: x\n"
+                for t in (T1, T2, T3)
+            )
+        else:
+            text = state["pass2_fail"]
+        if text:
+            with open(err, "a") as f:
+                f.write(text)
+        return type("R", (), {"returncode": 0})()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    return state
+
+
+def test_fallback_flow(fb, tmp_path, capsys):
+    rc = cli.main(["--url", PUB_URL, "--output", str(tmp_path)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert len(fb["calls"]) == 2
+    cmd2 = fb["calls"][1]
+    assert f"{YT2}|{T2.url}" in cmd2
+    assert PUB_URL not in cmd2
+    assert "Searching YouTube for 3 tracks spotDL could not match..." in out
+    assert "Done: 1 downloaded by spotDL, 1 by YouTube fallback, 2 missing" in out
+    lines = (tmp_path / "PL" / "missing.txt").read_text().splitlines()
+    assert lines == [
+        f"drill clinton - Under Your Skin | {T1.url}",
+        f"dark & sexy - Want U | {T3.url}",
+    ]
+
+
+def test_fallback_pass2_failure_is_missing(fb, tmp_path, capsys):
+    fb["pass2_fail"] = f"{T2.url} - LookupError: boom\n"
+    assert cli.main(["--url", PUB_URL, "--output", str(tmp_path)]) == 0
+    assert "0 by YouTube fallback, 3 missing" in capsys.readouterr().out
+    assert T2.url in (tmp_path / "PL" / "missing.txt").read_text()
+
+
+def test_no_fallback_skips_pass2(fb, tmp_path, capsys):
+    rc = cli.main(["--url", PUB_URL, "--output", str(tmp_path), "--no-fallback"])
+    assert rc == 0 and len(fb["calls"]) == 1
+    assert "3 missing" in capsys.readouterr().out
+
+
+def test_stale_missing_removed(fb, monkeypatch, tmp_path):
+    (tmp_path / "PL").mkdir()
+    (tmp_path / "PL" / "missing.txt").write_text("old")
+    monkeypatch.setattr(cli, "find_video", lambda t: YT2)
+    assert cli.main(["--url", PUB_URL, "--output", str(tmp_path)]) == 0
+    assert not (tmp_path / "PL" / "missing.txt").exists()
+
+
+def test_crash_without_error_file_returns_code(monkeypatch, fb, tmp_path):
+    monkeypatch.setattr(
+        "subprocess.run", lambda cmd, **kw: type("R", (), {"returncode": 3})()
+    )
+    assert cli.main(["--url", PUB_URL, "--output", str(tmp_path)]) == 3

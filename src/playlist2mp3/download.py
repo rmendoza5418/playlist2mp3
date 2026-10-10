@@ -68,18 +68,19 @@ def choose_mode(playlist: Playlist, user_id: str, force_official: bool = False) 
 
 
 def build_spotdl_command(
-    url: str,
+    queries: list[str],
     output_dir: str | Path,
     folder: str,
     fmt: str = "mp3",
     bitrate: str = "320k",
     threads: int = 4,
     cookie_file: str | None = None,
+    save_errors: str | Path | None = None,
 ) -> list[str]:
     """Build the spotDL argument list. The token goes through stdin, never here."""
     template = os.path.join(str(output_dir), folder, "{artists} - {title}.{output-ext}")
     cmd = [
-        sys.executable, "-m", "playlist2mp3._spotdl_shim", "download", url,
+        sys.executable, "-m", "playlist2mp3._spotdl_shim", "download", *queries,
         "--format", fmt,
         "--bitrate", bitrate,
         "--output", template,
@@ -89,6 +90,8 @@ def build_spotdl_command(
     ]
     if cookie_file:
         cmd += ["--cookie-file", cookie_file]
+    if save_errors:
+        cmd += ["--save-errors", str(save_errors)]
     return cmd
 
 

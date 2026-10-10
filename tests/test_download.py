@@ -63,19 +63,27 @@ def test_choose_mode_force_official():
 
 
 def test_build_command_free_has_no_token():
-    cmd = build_spotdl_command("u", "out", "F")
+    cmd = build_spotdl_command(["u"], "out", "F")
     assert "--auth-token" not in cmd
     assert "--cookie-file" not in cmd
     assert cmd[1:4] == ["-m", "playlist2mp3._spotdl_shim", "download"]
 
 
 def test_build_command_cookie_and_template():
-    cmd = build_spotdl_command("u", "out", "F", cookie_file="c.txt")
+    cmd = build_spotdl_command(["u"], "out", "F", cookie_file="c.txt")
     assert cmd[cmd.index("--cookie-file") + 1] == "c.txt"
     template = cmd[cmd.index("--output") + 1]
     assert template.endswith("{artists} - {title}.{output-ext}")
     assert template.startswith("out")
     assert "--auth-token" not in cmd
+
+
+def test_build_command_multiple_queries_and_save_errors():
+    cmd = build_spotdl_command(["a|b", "c|d"], "out", "F", save_errors="e.txt")
+    i = cmd.index("download")
+    assert cmd[i + 1:i + 3] == ["a|b", "c|d"]
+    assert cmd[cmd.index("--save-errors") + 1] == "e.txt"
+    assert "--save-errors" not in build_spotdl_command(["u"], "out", "F")
 
 
 def test_run_download_sends_token_on_stdin(monkeypatch, tmp_path):

@@ -134,10 +134,27 @@ playlist2mp3 --playlist "Road Trip" --dry-run
 | `--threads` | `4` | Parallel downloads. Must be 1 or higher. |
 | `--cookie-file PATH` | none | Cookies file for YouTube Music. The file must exist. |
 | `--official` | off | Force the official Spotify API. Works for playlists you own or collaborate on. |
+| `--no-fallback` | off | With `--url`, do not search YouTube for tracks spotDL cannot match. |
 | `--dry-run` | off | Print the spotDL command and exit. The token is hidden. |
 | `--version` | | Print the version. |
 
 Files are named `{artists} - {title}.{ext}`. spotDL skips files that already exist, so you can re-run a playlist to fetch new tracks.
+
+## When spotDL cannot match a track
+
+With `--url`, spotDL sometimes finds no match for small artists. The tool then searches YouTube itself for each failed track. It passes the video it finds to spotDL, which downloads it with the Spotify tags.
+
+A video is accepted only if all of these are true:
+
+- The main artist is in the channel name (without " - Topic") or in the video title.
+- The title is at least 80% similar to the track name, or the track name is inside the video title.
+- If both lengths are known, they differ by 5 seconds or less.
+
+Auto-generated "Artist - Topic" uploads rank higher.
+
+Tracks with no accepted video, or that still fail, are listed in `missing.txt` in the playlist folder. Each line has the form `artist - title | Spotify URL`. The tool deletes an old `missing.txt` when nothing is missing.
+
+The run ends with a line like `Done: 88 downloaded by spotDL, 9 by YouTube fallback, 3 missing (see missing.txt)`. Use `--no-fallback` to skip the YouTube search. Picker and `--official` modes have no fallback.
 
 ## Which playlists work
 
