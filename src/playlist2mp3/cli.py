@@ -1,0 +1,231 @@
+"""Command line interface."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sys
+from pathlib import Path
+
+import requests
+import spotipy
+import spotipy.oauth2
+from dotenv import load_dotenv
+from spotdl.utils.ffmpeg import get_ffmpeg_path
+
+from . import __version__
+from .download import (
+    UnavailablePlaylistError,
+    build_spotdl_command,
+    choose_mode,
+    is_downloadable,
+    run_download,
+    safe_folder_name,
+    strip_control,
+)
+from .spotify import ConfigError, Playlist
+
+FORMATS = ["mp3", "flac", "ogg", "opus", "m4a", "wav"]
+BITRATES = [
+    "auto", "disable",
+    "8k", "16k", "24k", "32k", "40k", "48k", "64k", "80k", "96k",
+    "112k", "128k", "160k", "192k", "224k", "256k", "320k",
+    *map(str, range(10)),
+]
+_PLAYLIST_ID = re.compile(r"playlist[/:]([A-Za-z0-9]{22})")
+SPOTIFY_ERRORS = (
+    spotipy.SpotifyException,
+    spotipy.oauth2.SpotifyOauthError,
+    requests.RequestException,
+)
+
+
+class PlaylistMatchError(Exception):
+    """Raised when --playlist matches zero or several playlists."""
+
+
+def positive_int(value: str) -> int:
+    """Argparse type for integers >= 1."""
+    n = int(value)
+    if n < 1:
+        raise argparse.ArgumentTypeError("must be >= 1")
+    return n
+
+
+def existing_file(value: str) -> str:
+    """Argparse type for a path that must exist."""
+    if not os.path.isfile(value):
+        raise argparse.ArgumentTypeError(f"file not found: {value}")
+    return value
+
+
+def output_dir(value: str) -> str:
+    """Argparse type that rejects spotDL template braces."""
+    if "{" in value or "}" in value:
+        raise argparse.ArgumentTypeError("must not contain '{' or '}'")
+    return value
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Create the argument parser."""
+    p = argparse.ArgumentParser(
+        prog="playlist2mp3",
+        description="Pick a Spotify playlist and download it with spotDL.",
+    )
+    p.add_argument("--playlist", metavar="TEXT",
+                   help="playlist id, URL, or exact name (skips the picker)")
+    p.add_argument("--output", metavar="DIR", type=output_dir, default="output",
+                   help="output directory (default: output)")
+    p.add_argument("--format", choices=FORMATS, default="mp3")
+    p.add_argument("--bitrate", choices=BITRATES, default="320k")
+    p.add_argument("--threads", type=positive_int, default=4)
+    p.add_argument("--cookie-file", metavar="PATH", type=existing_file)
+    p.add_argument("--official", action="store_true",
+                   help="force the official Spotify API (owned/collaborative only)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print the spotDL command without running it")
+    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    return p
+
+
+def match_playlist(playlists: list[Playlist], query: str) -> Playlist:
+    """Find one playlist by id, URL containing the id, or exact name."""
+    query = query.strip()
+    found = _PLAYLIST_ID.search(query)
+    wanted = found.group(1) if found else query
+    for pl in playlists:
+        if pl.id == wanted:
+            return pl
+    named = [pl for pl in playlists if pl.name.casefold() == query.casefold()]
+    if len(named) == 1:
+        return named[0]
+    if named:
+        lines = "\n".join(f"  {pl.id}  {strip_control(pl.name)}" for pl in named)
+        raise PlaylistMatchError(
+            f"Several playlists are named '{strip_control(query)}'. "
+            f"Use an id instead:\n{lines}"
+        )
+    raise PlaylistMatchError(f"No playlist matches '{strip_control(query)}'.")
+
+
+def format_row(index: int, pl: Playlist, user_id: str) -> str:
+    """Format one picker table row."""
+    count = "?" if pl.total is None else str(pl.total)
+    vis = {True: "public", False: "private"}.get(pl.public, "private")
+    parts = [f"{index:>3}.", strip_control(pl.name), f"[{count} tracks]", vis]
+    if pl.collaborative:
+        parts.append("collab")
+    if pl.owner_id != user_id:
+        parts.append(f"by {strip_control(pl.owner_name)}")
+    if not is_downloadable(pl, user_id):
+        parts.append("(unavailable)")
+    return "  ".join(parts)
+
+
+def pick_playlist(playlists: list[Playlist], user_id: str) -> Playlist:
+    """Show a numbered list and read a choice. Exits on q, EOF, or Ctrl-C."""
+    for i, pl in enumerate(playlists, 1):
+        print(format_row(i, pl, user_id))
+    while True:
+        try:
+            answer = input(f"Select a playlist [1-{len(playlists)}, q to quit]: ").strip()
+        except EOFError:
+            print()
+            sys.exit(0)
+        except KeyboardInterrupt:
+            print()
+            sys.exit(130)
+        if answer.lower() == "q":
+            sys.exit(0)
+        if answer.isdigit() and 1 <= int(answer) <= len(playlists):
+            return playlists[int(answer) - 1]
+        print("Invalid choice. Enter a number from the list or q.")
+
+
+def ffmpeg_missing() -> bool:
+    """Return True if spotDL cannot find ffmpeg."""
+    return get_ffmpeg_path() is None
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Entry point. Ctrl-C returns 130 without a traceback."""
+    try:
+        return _run(argv)
+    except KeyboardInterrupt:
+        print(file=sys.stderr)
+        return 130
+
+
+def _spotify_error(e: Exception) -> int:
+    msg = f"Error: {e}"
+    if getattr(e, "http_status", None) == 403:
+        msg += (
+            "\nHint: in development mode, add your Spotify account under "
+            "User Management in the Spotify developer dashboard."
+        )
+    print(msg, file=sys.stderr)
+    return 1
+
+
+def _run(argv: list[str] | None) -> int:
+    args = build_parser().parse_args(argv)
+    load_dotenv()
+
+    from . import spotify
+
+    try:
+        spotify.get_config()
+    except ConfigError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+
+    if not args.dry_run and ffmpeg_missing():
+        print(
+            "Error: ffmpeg not found. Install it (e.g. `brew install ffmpeg`) "
+            "or run `python -m spotdl --download-ffmpeg`.",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        sp, auth = spotify.authenticate()
+        user_id = spotify.current_user_id(sp)
+        playlists = spotify.list_playlists(sp)
+    except SPOTIFY_ERRORS as e:
+        return _spotify_error(e)
+    if not playlists:
+        print("No playlists found.")
+        return 0
+
+    try:
+        if args.playlist:
+            playlist = match_playlist(playlists, args.playlist)
+        else:
+            playlist = pick_playlist(playlists, user_id)
+        mode = choose_mode(playlist, user_id, args.official)
+    except (PlaylistMatchError, UnavailablePlaylistError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+
+    folder = safe_folder_name(playlist.name, playlist.id)
+    try:
+        token = auth.get_access_token() if mode == "official" else None
+    except SPOTIFY_ERRORS as e:
+        return _spotify_error(e)
+    cmd = build_spotdl_command(
+        playlist.url, args.output, folder, args.format, args.bitrate,
+        args.threads, args.cookie_file,
+    )
+    if args.dry_run:
+        print(" ".join(cmd))
+        return 0
+    print(
+        f"Downloading '{strip_control(playlist.name)}' ({mode} mode) "
+        f"to {Path(args.output) / folder}"
+    )
+    return run_download(cmd, Path(args.output) / folder, token)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

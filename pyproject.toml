@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "playlist2mp3"
+dynamic = ["version"]
+description = "Pick a Spotify playlist and download it as MP3 files with spotDL"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10,<3.15"
+dependencies = [
+    "spotdl>=4.5.2,<5",
+    "spotipy>=2.26,<3",
+    "python-dotenv>=1.0,<2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+playlist2mp3 = "playlist2mp3.cli:main"
+
+[tool.hatch.version]
+path = "src/playlist2mp3/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/playlist2mp3"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
