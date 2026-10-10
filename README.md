@@ -2,6 +2,20 @@
 
 Pick one of your Spotify playlists, find each track on YouTube Music with spotDL, and save MP3s to `output/<playlist name>/`.
 
+## Quick start (no Spotify Premium needed)
+
+Copy the link of a public playlist and run:
+
+```
+playlist2mp3 --url "<public playlist link>"
+```
+
+To copy the link, open the playlist in Spotify. Select Share, then Copy link to playlist.
+
+The playlist must be public. To download a private playlist, set it to public for the run. Then set it back to private.
+
+If `SPOTIFY_CLIENT_ID` is not set, running `playlist2mp3` with no arguments asks you to paste a link.
+
 ## How it works
 
 ```
@@ -33,9 +47,11 @@ output/<playlist>/
 
 - Python 3.10 to 3.14
 - ffmpeg. Install it with `brew install ffmpeg` or `python -m spotdl --download-ffmpeg`. The tool accepts the copy that spotDL downloads to `~/.spotdl`.
-- A Spotify developer app (see below).
+- Optional: a Spotify developer app, only for the playlist picker (see below).
 
-## Spotify app setup
+## Optional: pick from your playlists (needs Spotify Premium)
+
+The picker lists your own playlists, including private ones. It needs a Spotify developer app.
 
 1. Create an app at https://developer.spotify.com/dashboard.
 2. Select "Web API".
@@ -110,6 +126,7 @@ playlist2mp3 --playlist "Road Trip" --dry-run
 
 | Flag | Default | Description |
 | --- | --- | --- |
+| `--url URL` | none | Public playlist URL. No login or client ID needed. Cannot combine with `--playlist` or `--official`. |
 | `--playlist TEXT` | none | Playlist ID, URL, or exact name. Skips the picker. |
 | `--output DIR` | `output` | Output directory. Files go to `DIR/<playlist name>/`. It must not contain `{` or `}`. |
 | `--format` | `mp3` | One of `mp3`, `flac`, `ogg`, `opus`, `m4a`, `wav`. |
@@ -139,6 +156,7 @@ YouTube streams about 128 to 160 kbps. With YouTube Music Premium cookies passed
 
 - The login token is cached at `~/.cache/playlist2mp3/token.json` with `0600` permissions.
 - Never commit `.env`.
+- URL mode uses spotDL's unofficial public reader. It contacts Spotify's web player endpoints. It may fetch a secret from code.thetadev.de. If that fails, spotDL uses a built-in default.
 - For private playlists, the tool passes the short-lived token to spotDL through stdin. It never appears on the command line or in the process list.
 - The repository includes `uv.lock`. Dependabot proposes updates each week.
 

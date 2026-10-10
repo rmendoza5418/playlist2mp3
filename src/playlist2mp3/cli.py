@@ -24,6 +24,7 @@ from .download import (
     safe_folder_name,
     strip_control,
 )
+from .public import canonical_url, fetch_public_playlist, parse_playlist_id
 from .spotify import ConfigError, Playlist
 
 FORMATS = ["mp3", "flac", "ogg", "opus", "m4a", "wav"]
@@ -67,22 +68,34 @@ def output_dir(value: str) -> str:
     return value
 
 
+def public_url(value: str) -> str:
+    """Argparse type for a public Spotify playlist URL or URI."""
+    if parse_playlist_id(value) is None:
+        raise argparse.ArgumentTypeError(
+            "not a Spotify playlist URL (expected https://open.spotify.com/playlist/<id>)"
+        )
+    return value.strip()
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Create the argument parser."""
     p = argparse.ArgumentParser(
         prog="playlist2mp3",
         description="Pick a Spotify playlist and download it with spotDL.",
     )
-    p.add_argument("--playlist", metavar="TEXT",
-                   help="playlist id, URL, or exact name (skips the picker)")
+    source = p.add_mutually_exclusive_group()
+    source.add_argument("--url", metavar="URL", type=public_url,
+                        help="public playlist URL (no login needed)")
+    source.add_argument("--playlist", metavar="TEXT",
+                        help="playlist id, URL, or exact name (skips the picker)")
     p.add_argument("--output", metavar="DIR", type=output_dir, default="output",
                    help="output directory (default: output)")
     p.add_argument("--format", choices=FORMATS, default="mp3")
     p.add_argument("--bitrate", choices=BITRATES, default="320k")
     p.add_argument("--threads", type=positive_int, default=4)
     p.add_argument("--cookie-file", metavar="PATH", type=existing_file)
-    p.add_argument("--official", action="store_true",
-                   help="force the official Spotify API (owned/collaborative only)")
+    source.add_argument("--official", action="store_true",
+                        help="force the official Spotify API (owned/collaborative only)")
     p.add_argument("--dry-run", action="store_true",
                    help="print the spotDL command without running it")
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -143,6 +156,25 @@ def pick_playlist(playlists: list[Playlist], user_id: str) -> Playlist:
         print("Invalid choice. Enter a number from the list or q.")
 
 
+def prompt_public_url() -> str:
+    """Ask for a public playlist URL. Exits on q, EOF, or Ctrl-C."""
+    print("SPOTIFY_CLIENT_ID is not set, so the playlist picker is off.")
+    while True:
+        try:
+            answer = input("Paste a public Spotify playlist URL (q to quit): ").strip()
+        except EOFError:
+            print()
+            sys.exit(0)
+        except KeyboardInterrupt:
+            print()
+            sys.exit(130)
+        if answer.lower() == "q":
+            sys.exit(0)
+        if parse_playlist_id(answer):
+            return answer
+        print("Invalid URL. Paste a link like https://open.spotify.com/playlist/<id> or q.")
+
+
 def ffmpeg_missing() -> bool:
     """Return True if spotDL cannot find ffmpeg."""
     return get_ffmpeg_path() is None
@@ -168,17 +200,47 @@ def _spotify_error(e: Exception) -> int:
     return 1
 
 
+def _run_public(url: str, args: argparse.Namespace) -> int:
+    playlist_id = parse_playlist_id(url)
+    assert playlist_id is not None
+    clean_url = canonical_url(playlist_id)
+    try:
+        name, count = fetch_public_playlist(clean_url)
+    except Exception as e:
+        print(
+            f"Error: could not read playlist. Is it public?\n{strip_control(str(e))}",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"Playlist: {strip_control(name)} ({count} tracks)")
+    folder = safe_folder_name(name, fallback=playlist_id)
+    cmd = build_spotdl_command(
+        clean_url, args.output, folder, args.format, args.bitrate,
+        args.threads, args.cookie_file,
+    )
+    if args.dry_run:
+        print(" ".join(cmd))
+        return 0
+    print(f"Downloading (free mode) to {Path(args.output) / folder}")
+    return run_download(cmd, Path(args.output) / folder, None)
+
+
 def _run(argv: list[str] | None) -> int:
     args = build_parser().parse_args(argv)
     load_dotenv()
 
     from . import spotify
 
-    try:
-        spotify.get_config()
-    except ConfigError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        return 2
+    url = args.url
+    if not url and not args.playlist and not os.environ.get("SPOTIFY_CLIENT_ID", "").strip():
+        url = prompt_public_url()
+
+    if not url:
+        try:
+            spotify.get_config()
+        except ConfigError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 2
 
     if not args.dry_run and ffmpeg_missing():
         print(
@@ -187,6 +249,9 @@ def _run(argv: list[str] | None) -> int:
             file=sys.stderr,
         )
         return 2
+
+    if url:
+        return _run_public(url, args)
 
     try:
         sp, auth = spotify.authenticate()
